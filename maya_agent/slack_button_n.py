@@ -10,7 +10,11 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from threading import Event
 import json
 from dotenv import load_dotenv
-# from .workflow_manager import resume_workflow # MOVED
+
+# Import database functions and other necessary logic
+from maya_agent.database import get_draft_by_job_id, delete_user_draft, update_draft
+from edit_rag.edit_formatter import run_job_rewrite_pipeline
+
 
 # Step 1: go up one directory level from this script's location
 env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.env'))
@@ -38,18 +42,19 @@ job_storage = {}       # job_id → job_description storage
 @app.action("draft_click")
 def handle_button_click(ack, body, client, action):
     ack()
-    from .workflow_manager import resume_workflow # MOVED HERE
 
     # 🔍 Decode block_id JSON to extract job_id and user_name
     try:
         block_metadata = json.loads(action.get("block_id", "{}"))
         job_id = block_metadata.get("job_id")
         user_name = block_metadata.get("user_name", "user")
-        user_id = block_metadata.get("user_id", "123")
+        user_id= block_metadata.get("user_id","123")
         is_edit_workflow = block_metadata.get("is_edit_workflow", False)  # New flag for edit workflow
     except Exception as e:
         print("⚠ Failed to parse block_id metadata:", e)
-        return
+        job_id = "unknown"
+        user_name = "user"
+        is_edit_workflow = False
 
     clicked_action = action["action_id"]
     message_ts = body["message"]["ts"]
@@ -57,28 +62,58 @@ def handle_button_click(ack, body, client, action):
 
     print(f"🖱 Button clicked: {clicked_action} for job_id: {job_id} by @{user_name}")
 
-    user_data = {
-        "user_id": user_id,
-        "user_name": user_name,
-        "channel_id": channel_id,
-    }
+    # Retrieve the job from the database
+    job_data = get_draft_by_job_id(job_id)
+    if not job_data:
+        result_text = f"❌ Sorry <@{user_id}>, I couldn't find the original job data. It might have expired or been deleted."
+        _update_slack_message(client, body, result_text)
+        return
 
-    # Run the workflow in a separate thread to avoid blocking
-    workflow_thread = Thread(target=resume_workflow, args=(job_id, clicked_action, user_data))
-    workflow_thread.start()
-
-    # Update the message to give immediate feedback
     if clicked_action == "approve_click":
-        result_text = f"✅ Thanks for the confirmation, <@{user_id}>. I'm now posting the job to LinkedIn. This may take a moment."
+        result_text = f"✅ Thanks for the confirmation, <@{user_id}>. I'm now posting the job on LinkedIn."
+        # In a real scenario, you would trigger the LinkedIn posting logic here.
+        # For now, we'll just confirm to the user.
+        delete_user_draft(job_id, user_id) # Clean up the draft
     elif clicked_action == "reject_click":
         result_text = f"❌ No worries <@{user_id}>, I’ve canceled the posting."
+        delete_user_draft(job_id, user_id) # Clean up the draft
     elif clicked_action == "edit_click":
-        result_text = f"✏️ Okay, <@{user_id}>! I'm ready for your edits. What would you like to change?"
+        # The user wants to edit. We'll set the edit mode state.
+        edit_mode_path = os.path.join(os.path.dirname(__file__), '..', 'edit_mode.json')
+        try:
+            with open(edit_mode_path, 'r') as f:
+                edit_mode = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            edit_mode = {}
+        
+        edit_mode[user_id] = {
+            "status": True,
+            "message": job_data.get("description", ""),
+            "job_id": job_id,
+            "channel_id": channel_id,
+            "user_name": user_name,
+            "job_data": job_data
+        }
+        
+        with open(edit_mode_path, 'w') as f:
+            json.dump(edit_mode, f)
+            
+        result_text = f"✏ Got it <@{user_id}>, I've marked this for editing. Please provide the necessary changes."
+        
     elif clicked_action == "draft_click":
-        result_text = f"📋 Got it, <@{user_id}>. I've moved this to your drafts."
+        result_text = f"📋 Got it <@{user_id}>, I've saved this job to your drafts."
+        # The job is already in the drafts, so we just confirm.
+        # Optionally, you could update a status field here.
     else:
-        result_text = "❓ Action recorded."
+        result_text = f"❓ Unknown action clicked."
 
+    # Update the message in Slack to show the result
+    _update_slack_message(client, body, result_text)
+
+
+def _update_slack_message(client, body, result_text):
+    message_ts = body["message"]["ts"]
+    channel_id = body["channel"]["id"]
     client.chat_update(
         channel=channel_id,
         ts=message_ts,
@@ -89,11 +124,12 @@ def handle_button_click(ack, body, client, action):
         }]
     )
 
+
 # ====== Send Job Description to Slack ======
 def send_job_desc(CHANNEL_ID, JOB_DESC, job_id, user_name, user_id):
     client = app.client
-    
-    # 👉 Encode user info into block_id as JSON (removed job_desc to fix character limit)
+
+    # 👉 Encode user info into block_id as JSON
     block_metadata = json.dumps({
         "job_id": job_id, 
         "user_name": user_name,
@@ -122,60 +158,25 @@ def send_job_desc(CHANNEL_ID, JOB_DESC, job_id, user_name, user_id):
         ]
     )
 
-    print(f"✅ Message with buttons sent for job_id: {job_id}. Not waiting for response.")
-    # No longer waiting, so we return immediately
-    return "pending"
+    # NO MORE WAITING! The function returns immediately.
+    print(f"✅ Message sent for job_id: {job_id}. Not waiting for response.")
 
 @app.action("approve_click")
 def handle_approve(ack, body, client, action):
-    ack()
-    block_metadata = json.loads(action.get("block_id", "{}"))
-    user_id = block_metadata.get("user_id", "user")
-    result_text = f"✅ Perfect! I'm posting your job to LinkedIn now..."
-    _update_slack_message(client, body, result_text)
-    # ... set response_values ...
-    job_id = block_metadata.get("job_id")
-    response_values[job_id] = "approve"
+    # This function is now handled by the generic handle_button_click
+    pass
 
 @app.action("reject_click")
 def handle_reject(ack, body, client, action):
-    ack()
-    block_metadata = json.loads(action.get("block_id", "{}"))
-    user_id = block_metadata.get("user_id", "user")
-    result_text = f"❌ No problem! I've discarded this job posting."
-    _update_slack_message(client, body, result_text)
-    job_id = block_metadata.get("job_id")
-    response_values[job_id] = "reject"
+    # This function is now handled by the generic handle_button_click
+    pass
 
 @app.action("edit_click")
 def handle_edit(ack, body, client, action):
-    ack()
-    block_metadata = json.loads(action.get("block_id", "{}"))
-    user_id = block_metadata.get("user_id", "user")
-    result_text = f"✏️ Sure! Please provide your edits."
-    _update_slack_message(client, body, result_text)
-    job_id = block_metadata.get("job_id")
-    response_values[job_id] = "edit"
+    # This function is now handled by the generic handle_button_click
+    pass
 
 @app.action("draft_click")
 def handle_draft(ack, body, client, action):
-    ack()
-    block_metadata = json.loads(action.get("block_id", "{}"))
-    user_id = block_metadata.get("user_id", "user")
-    result_text = f"📄 Got it! I've moved this job to your drafts folder."
-    _update_slack_message(client, body, result_text)
-    job_id = block_metadata.get("job_id")
-    response_values[job_id] = "draft"
-
-def _update_slack_message(client, body, result_text):
-    message_ts = body["message"]["ts"]
-    channel_id = body["channel"]["id"]
-    client.chat_update(
-        channel=channel_id,
-        ts=message_ts,
-        text="Response recorded.",
-        blocks=[{
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": result_text}
-        }]
-    )
+    # This function is now handled by the generic handle_button_click
+    pass

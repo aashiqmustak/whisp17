@@ -126,7 +126,7 @@ def create_draft_table():
     conn.close()
     print("✅ Database tables created/verified successfully")
 
-def insert_draft(job_id, user_id, username, channel_id, job_data, description, status='active'):
+def insert_draft(job_id, user_id, username, channel_id, job_data, description):
     """Insert a new job draft into the database with enhanced data"""
     try:
         conn = sqlite3.connect(DB_FILE)
@@ -165,7 +165,7 @@ def insert_draft(job_id, user_id, username, channel_id, job_data, description, s
             job_data.get("education"),
             description,
             datetime.utcnow().isoformat(),
-            status,
+            'active',
             json.dumps(tags) if tags else None,
             priority,
             salary_range,
@@ -230,25 +230,8 @@ def get_latest_user_draft(user_id):
         return {}
 
 
-def update_draft_status(job_id: str, status: str):
-    """Update the status of a specific job draft."""
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
 
-        cursor.execute("""
-            UPDATE drafts 
-            SET status = ?, updated_at = ? 
-            WHERE job_id = ?
-        """, (status, datetime.utcnow().isoformat(), job_id))
 
-        conn.commit()
-        conn.close()
-        print(f"✅ Updated status for job_id {job_id} to '{status}'")
-        return True
-    except Exception as e:
-        print(f"❌ Error updating status for job_id {job_id}: {e}")
-        return False
 
 
 def get_draft_by_job_id(job_id):

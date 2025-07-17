@@ -20,16 +20,14 @@ import requests
 from langgraph.graph import StateGraph, START, END
 import uuid
 from threading import Thread
-# from maya_agent.slack_button_n import app as slack_app, SLACK_APP_TOKEN # MOVED
+from maya_agent.slack_button_n import app as slack_app, SLACK_APP_TOKEN  # ← re-use from slack_button.py
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-# from maya_agent.slack_button_n import send_job_desc # MOVED
+from maya_agent.slack_button_n import send_job_desc
 from rag_it1.retrieval.vectorstore import get_vectorstore
-from maya_agent.database import insert_draft, update_draft_status
+from maya_agent.database import insert_draft
 
-# The Slack App needs to be initialized here for the SocketModeHandler to work
-from maya_agent.slack_button_n import app as slack_app, SLACK_APP_TOKEN
 Thread(target=lambda: SocketModeHandler(slack_app, SLACK_APP_TOKEN).start(), daemon=True).start()
-
+# redis_manager = RedisManager() # No longer needed
 # ========== Config ==========
 LINKEDIN_ACCESS_TOKEN = os.getenv("LINKEDIN_ACCESS_TOKEN")
 PERSON_URN = os.getenv("PERSON_URN")
@@ -137,7 +135,6 @@ def job_req(state: AgentState) -> AgentState:
 # ========== Node: Job Description ==========
 def job_description_llm(state: AgentState) -> AgentState:#add Channel id as a parameter
     print("🧠 [job_description_llm]")
-    from maya_agent.slack_button_n import send_job_desc # MOVED HERE
 
     user_id = state["user_id"]
     user_name = state["user_name"]
@@ -172,34 +169,42 @@ def job_description_llm(state: AgentState) -> AgentState:#add Channel id as a pa
         state["job_data"]["llm_description"] = description
         # 🔁 Slack interactive part
         job_id = str(uuid.uuid4())[:8]
- 
-        # First, save the generated job description as a draft
+
+        # Save the job as a draft first
         insert_draft(
             job_id=job_id,
             user_id=user_id,
             username=user_name,
             channel_id=channel_id,
             job_data=job,
-            description=description,
-            status="pending_approval"  # New status
+            description=description
         )
- 
+
         if user_id:
-            delete_user_data(user_id)
-         
-        # Now, send the message with buttons, but don't wait
-        action = send_job_desc(channel_id, description, job_id, user_name, user_id)
-         
-        # The 'action' will now be 'pending', so we halt the workflow here.
-        # The workflow will be resumed by the workflow_manager when a button is clicked.
-        if action == "pending":
-            print(f"⌛ Job {job_id} is pending user approval. Halting workflow.")
-            state["error"] = "WORKFLOW_PENDING" # Special state to stop the graph
+                delete_user_data(user_id)
+        next_request = queue_manager.get_next_request_for_user(str(user_id))
+        
+        if next_request==None:
+            queue_manager.mark_user_free(str(user_id))
+        else:
+            # process_single_user(str(user_id),str(next_request))
+            thread1 = threading.Thread(target=process_single_user,args=(str(user_id),str(next_request)))
+            thread1.start()
+        action = send_job_desc(channel_id, description, job_id,user_name,user_id)
+        
+        # The logic is now handled in slack_button_n.py, so we can remove it from here.
+        # We just need to check if the action was to edit, and if so, stop the current flow.
+        if action =="edit":
+            print("User clicked edit, edit workflow initiated.")
+            state["error"] = "EDIT Started"
+
+        
     except Exception as e:
+        print(f"❌ Error in job description generation: {e}")
         state["error"] = f"❌ LLM Error: {e}"
         state["job_data"]["llm_description"] = "⚠ Failed to generate description."
         print(state["error"])
-         
+
     return state
 
 # ========== Node: Post Job ==========
