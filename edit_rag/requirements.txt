@@ -1,0 +1,7 @@
+langchain
+langchain-community
+langchain-nvidia-ai-endpoints
+chromadb
+python-dotenv
+tqdm
+redis>=4.0.0
